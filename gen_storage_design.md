@@ -53,7 +53,7 @@ When an insert or update occurs, the document is written to the end of the file,
 
 The tail-append design means additional seeks are necessary to write the data (excluding file system metadata), which minimizes write amplification in SSDs and disk seeks on HDDs.
 
-"Write amplification" is the additional low level storage blocks that must be rewritten for any successful write on a SSD. Sequential writes/tail will minimize write amplification, random internal writes tend to maximize it. Lowering write amplification increases SSD write performance and operational life.
+"Write amplification" is the additional low level storage blocks that must be rewritten for any successful write on a SSD. Sequential writes/tail append will minimize write amplification, random internal writes tend to maximize it. Lowering write amplification increases SSD write performance and operational life.
 
 <http://en.wikipedia.org/wiki/Write_amplification>
 
@@ -87,54 +87,113 @@ Until compaction happens, this can have higher space requirements than update-in
 
 Batching many updates into a single commit will also reduce the amount of btree nodes rewritten per document, and becoming more even efficient the more tightly grouped the updates are in the leaf nodes.
 
-Unlike update in-place btrees, Couchstore btree's do not self balance. So long as all updates are inserts, they are guaranteed to remain balanced. But certain update patterns (value resizing and deletes) can cause them to become unbalanced. However, the process of database compaction will regenerate the btrees from the ground up and optimally rebalance them.
+Unlike update in-place btrees, Couchstore btree's do not self balance. For the by\_id btree, since it doesn't "lose values", all operations are guaranteed to keep the btree balanced. So long as all updates are inserts, the by\_seq btree will remain balanced. But certain update patterns can cause the by\_seq btree to become unbalanced. However, the process of database compaction, necessary in the update case, will regenerate the btrees from the ground up and restore optimal locality and rebalance.
 
 ## Crash/Powerloss tolerant
 
 Because of the tail-append nature, any update to that fails to complete will also fail to write a valid header. When the file is reopened, the incompletely written data is seen as garbage at the end of the file and skipped over until the system finds the first valid header, and all data preceding it will be valid, assuming the physical media has not corrupted.
 
+Currently Couchstore and CouchDB do 2 fsyncs to ensure the database can never be corrupted. First they fsync all data and btree writes to disk, and then write the new header (at the end of the file) to point to the newly updated btrees.
+
+### Reducing fsyncs
+
+If for single or batched update, if we write all the data, btree updates and header and then do a single fsync, when the fsync successfully returns everything will correct on disk. 
+
+However, there is a small possibility the OS will reorder how it durably writes the files to disk, and can write out the header before other data in the same commit. If a crash or powerloss occurs during this reordered writes, on restart it's possible the system will find and use this header that eventually points to incompletely written data, which results in the same problems a data corruption. It's possible a single document is corrupted, or the root of a btree, making it impossible to access any document in the database. It won't know the data is corrupted until sometime later when it tries to read these incomplete items.
+
+A simple enhancement is use a single fsync scheme for a commit, and when a server opens a database file for the first time after startup, it scans and reads all data, meta, and btree nodes whose file location is _after_ the previous header, but _before_ the current header. If any data is detected as corrupt (fails the CRC32 check), is instead uses the previous header as the correct header and truncates the file directly after it, effectively detecting and removing the incomplete transaction.
+
+The tradeoff is we now half the fsyncs, but we must scan all data and meta from the last transaction on startup. Fortunately all the data is in a single contiguous region on disk, greatly reduce the seek cost if the area is prefetched.
+
 ## MVCC
 
-When updates occurs, any existing on-disk data and metadata aren't modified. This means MVCC snapshotting of the entire database file is automatic, as reads to the database can happen concurrently with writes, with no hard limit on the number of concurrent read snapshots. This is particularly important when performing range scans of by\_seq index for UPR, which requires UPR clients (backup utlities, indexers, replicators, etc) are able to get a consistent and complete snapshot to ensure fast recovery points in failover scenarios.
+When updates occurs, any existing on-disk data and metadata aren't modified. This means MVCC snapshotting of the entire database file is automatic and essentially free, requiring no explicit locks or resources beyond what a single threaded access require, as reads to the database can happen concurrently with writes, with no hard limit on the number of concurrent read snapshots. With a shared file cache, each concurrent reader often uses less resources per-snapshot (file system cache memory and disk fetches).
+
+The efficiency of snapshotting is particularly important when performing range scans of by\_seq index for UPR, which requires UPR clients (backup utlities, indexers, replicators, etc) are able to get a consistent and complete snapshot to ensure fast recovery points in failover scenarios.
 
 ## Compaction
 
+Compaction is the process of recovering wasted space in a storage file and arranging all the live data in a and btrees to be optimized for size and arrangement. It copies all data and btree indexes from the old file to a new file. It does this without without stopping or pausing persistence and fetches, but can result in duplicate IO for writes that occurred during the compaction.
 
-## Shortcomings
+The compaction doesn't block reads or writes, letting them proceed normally, though possibly slowed through increased io bandwith of the copying process.
 
-### Filesystem Cache
+The compaction process scans the by\_seq index and load all the live documents from the database and copying them into a new file. It creates a by\_seq index bottom up in the new file by building the node the leafs up to the root node, the sorts the same information by key/id with on-disk heap sort, and then builds up the new by\_id btree from the bottom up.
 
-### Compaction
+Once it's completed a snapshot, it checks to see if it's caught up with the old storage file, as new mutations could have been committed to it during the compaction. It then walks the by_seq index of the old file, picking up from the sequence where it left off, copying values into the new database file.
 
-In CouchDB, all documents are written to a single storage file, meaning compaction requires at least as much free diskspace as the newly compacted file will require once complete. This means a filesystem without a fairly large amount of spare storage cannot complete a compaction.
+It repeats this process until it's fully caught up with all mutations to the main file. It's theoretically possible the updates to the main file happen faster than compaction can keep up with, but this has never been observed in practice.
 
-In Couchbase 2.0 all documents are written to a partition specific storage file, and with 1024 partitions it effectively solves the free space problem with compaction as it is now far more incremental and needs much less space storage space. But this introduces a new problem where durably committing a large number of documents requires a large number of fsyncs, as each partition must be fsync'd before all the documents are considered committed.
+### Shortcomings
 
-Best case
+In CouchDB, all documents for a database are written to a single storage file, meaning compaction requires at least as much free diskspace as the newly compacted file will require once complete, which must hold the entire data set. This means a filesystem without a fairly large amount of spare storage cannot complete a compaction.
 
-Worst case
+In Couchbase 2.0 all documents are written to a partition specific storage file, and with 1024 partitions it effectively solves the free space problem with compaction as it is now far more incremental (each unit of compaction work is 1/1024 of the total database) and therefore needs much less temporary disk space or memory.
 
-## Double FSync
+It also makes it easy to read, write or delete many or all documents from a partition more efficiently, as is the case for rebalances. Documents grouped by partition have better locality for scans, writing in bulk doesn't cause extra IO in other partitions, and deleting a partition is simply deleting the storage file as a single operation.
 
-## Generational Storage
+But the Couchbase storage this introduces a new problem, to durably committing a large number of documents to different paritions requires at a minimum 1 fsync per partition, greatly increasing latency for a durable commit.
+
+Also, there is worst case of compaction, where a single document in a large partition is updated repeatedly. Recovering the garbage space from the updates means copying all documents in the partition to a new file, even the documents that haven't been updated in a very long time. The cost of compaction is N for N total documents in the partition, even though only 1 document is being updated. The cost of recovering the space for 1 document is O(N\*log(N)), where N is the total number of documents.
+
+The best case for compaction for M different document updates when there is a even distribution of single updates across all documents. In this best case, the cost of recovering the space for each of M documents is O((N/M)\*log(N)), where N is the total number of documents.
+
+# Generational Storage
+
+Generational Append-Only Storage is a new design that is heavily based on the current Couchstore design, and addresses many of the shortcomings, particularly for interactive workloads.
+
+It has been empirically observed that most interactive workloads have approximations of a Zipfian/Zeta distribution of retrievals and updates to documents. This means the most popular document is retrieved/updated 2x more than the next most popular, 3x more than the next after that, 4x more the one after that, and so one.
+
+The generational storage system attempts to group documents into generations of "hotness", where the most updated documents stay in the smallest, hottest and most frequently compacted generation, colder documents tend  to migrate down to the next exponentially larger, colder generation (which because it's updated less frequently is compacted less frequently), and the colder still documents migrate down to the next exponentially larger, colder, less frequently compacted generation, and so on.
+
+When workloads where many documents have widely ranging update frequencies (such as Zipfian) the frequency of update of a document (it's "hotness") determines the generation the document migrates to, and how therefore how frequently it gets compacted.
+
+Some key properties we want to maintain when working with a interactive/Zipfian workloads:
+
+* Consistent low latency durable writes/updates and fetches
+* Storage immune to corruption due to process/OS crash or powerloss
+* Fast startup and warmup time
+* High throughput, restartable by\_seq scans when indexing, replicating, rebalancing or backing-up a large amounts of changes
+* Partition level MVCC for reads and consistency of indexing and replication (necessary for UPR)
+* Efficient partition rebalance in and out.
+* Cost of rebalancing a partition onto and off of a node is the same regardless the number/size of other partitions on a node
+* Reduce the overhead necessary for compaction.
+* Pauseless compaction (files are compacted, reorganized, and defragmented without pausing updates or fetches)
+* Low diskspace overhead (disk space usage isn't dominated by internal fragmentation or index overhead)
 
 # System Architecture
 
-File versioning
+## Write Ahead Log
+
+All commits to storage are written to an index-less, tail-append write ahead log (WAL) file. There are a series of these files numbered from 0 and up (0.log, 1.log ... _N_.log), and all new mutations happen to the highest numbered file. Until the data is moved to partition specific storage, the most recent update to a document is kept in memory (as dirty) and cannot be ejected. However, once written and persisted to the log, a client waiting for the write to be durable will get the success response from the server.
+
+On startup, the WAL file or files are read from beginning to end into memory, with subsequent updates to the same document replacing in the in-memory representation of the earlier mutation. These newly read document are still marked dirty until they are written and committed to partition specific storage.
+
+The advantage of the WAL is to reduce the latency of a durable commits, as it only has to wait on a single fsync of a sequential write for all partitions, instead of an fsync per partition, which can increase latency dramatically.
+
+The downside is the every document commit in the worst case will written to disk at least 2 times, once to the log and at least once in the partition specific generational storage, increasing disk contention and reducing throughput from it's theoretical maximum. For documents that are updated constantly, the number of times a write is rewritten can be much smaller, as only the most recent commit is copied the partition storage, the rest are ignored.
+
+## Async Copy from WAL to Storage
+
+Asynchronous to WAL commits, a separate process or thread will copy the most recent versions of data from memory to the youngest generation of partition specific storage. When this process starts, writes to the most recent (highest numbered) log file cease and new writes happen to a new high numbered log file. Once the partition copy process has copied all the live data from that log file to their specific partition storage, that log file is deleted. The process then begins again with next highest numbered log file, until no more mutations remain.
+
+### Natural Throttle
+
+While it is copying files from the log to storage, it might need to recopy data from a younger generation to an older generation and/or in-place compact any of the generational files. When this happens, the copy/compaction process may get behind the update/insert rate of the log files. If this happens for too long, all the bucket memory quota will be dedicated to "dirty" items (even though they are safe on disk) and it will pause updates. which as the bucket will exceed it's memory quota therefore will not be able to accept any client writes, until the  
+
+## File versioning
+
+
 
 ## Performing an Insert
 
 ## Performing an Update
 
-## Single FSync
+## Single fsync
 
 ## Live Data Threshold
 
-## Write Ahead Log
 
 ### Growth and copying
-
-## Async Copy from WAL to Storage
 
 ## MVCC
 
