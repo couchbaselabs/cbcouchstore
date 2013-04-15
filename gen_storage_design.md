@@ -11,12 +11,12 @@ This document describes the design, integration and implementation consideration
 
 Generational Storage (GS) is an evolution of the tail append design of CouchDB and Couchstore (the Couchbase storage subsystem).
 
-The CouchDB and Couchstore storage system uses a tail append design, where all updates to a database resulted in appending new or updated information to storage file. Even deletes would grow the storage files until compaction.
+The CouchDB and Couchstore storage system uses a tail append design, where all updates to a database result in appending new or updated information to storage file. Even deletes would grow the storage files until compaction.
 
 Some advantages of this design are:
 * Extremely efficient and fast durable updates, minimizing disk head seeks on HDDs and minimizing write amplification on SSDs.
 * Fast and simple recovery from crashes, simply scan backwards from the end of the file to the first good header and start using the file.
-* Zero cost MVCC snapshots. Simply use the most recent version of a file header and get a completely consistent storage file.
+* Zero cost MVCC snapshots. Simply use the most recent version of a file header and get a completely consistent storage file concurrent with updates and compaction.
 
 The biggest disadvantage is that recovering wasted file space means copying all live to another file. Even if all the wasted space is due to small portion of the documents being updated, it will still require copying all live documents to a new file.
 
@@ -47,7 +47,7 @@ When opening the file, the file is scanned backward to find the first intact hea
 
 For datablocks (documents, btrees nodes or anything not a header), any data that spans across the 4k marker will have the 0x00 added when written, and stripped out when read. Otherwise Couchbase is not aware of any other block boundaries.
 
-### All writes are appends
+### All Mutations Are Appends
 
 When an insert or update occurs, the document is written to the end of the file, and the btrees and the contained metadata are updated and written to the end of the file. If it's a deletion, then typically only the btrees are updated. Then the header is written.
 
@@ -127,37 +127,39 @@ It repeats this process until it's fully caught up with all mutations to the mai
 
 In CouchDB, all documents for a database are written to a single storage file, meaning compaction requires at least as much free diskspace as the newly compacted file will require once complete, which must hold the entire data set. This means a filesystem without a fairly large amount of spare storage cannot complete a compaction.
 
-In Couchbase 2.0 all documents are written to a partition specific storage file, and with 1024 partitions it effectively solves the free space problem with compaction as it is now far more incremental (each unit of compaction work is 1/1024 of the total database) and therefore needs much less temporary disk space or memory.
+In Couchbase 2.0 all documents are written to a partition specific storage file, and with 1024 partitions it effectively solves the free space problem with compaction as it is now far more incremental (each unit of compaction work is 1/1024 of the total dataset) and therefore needs much less temporary disk space or memory.
 
 It also makes it easy to read, write or delete many or all documents from a partition more efficiently, as is the case for rebalances. Documents grouped by partition have better locality for scans, writing in bulk doesn't cause extra IO in other partitions, and deleting a partition is simply deleting the storage file as a single operation.
 
-But the Couchbase storage this introduces a new problem, to durably committing a large number of documents to different paritions requires at a minimum 1 fsync per partition, greatly increasing latency for a durable commit.
+But the Couchbase storage this introduces a new problem, to durably committing a large number of documents to different partitions requires at a minimum 1 fsync per partition, greatly increasing latency for a durable commit.
 
-Also, there is worst case of compaction, where a single document in a large partition is updated repeatedly. Recovering the garbage space from the updates means copying all documents in the partition to a new file, even the documents that haven't been updated in a very long time. The cost of compaction is N for N total documents in the partition, even though only 1 document is being updated. The cost of recovering the space for 1 document is O(N\*log(N)), where N is the total number of documents.
+Also, there is worst case of compaction, where a single document in a large partition is updated repeatedly. Recovering the garbage space from the updates means copying all documents in the partition to a new file, even the documents that haven't been updated in a very long time. The cost of compaction is O(N*Log(N)) for N total documents in the partition, even though only 1 document is being updated. The cost of recovering the space for 1 document is O(N\*log(N)), where N is the total number of documents.
 
-The best case for compaction for M different document updates when there is a even distribution of single updates across all documents. In this best case, the cost of recovering the space for each of M documents is O((N/M)\*log(N)), where N is the total number of documents.
+The best case for compaction is when there is a even distribution of single updates across all documents.
 
 # Generational Storage
 
 Generational Append-Only Storage is a new design that is heavily based on the current Couchstore design, and addresses many of the shortcomings, particularly for interactive workloads.
 
-It has been empirically observed that most interactive workloads have approximations of a Zipfian/Zeta distribution of retrievals and updates to documents. This means the most popular document is retrieved/updated 2x more than the next most popular, 3x more than the next after that, 4x more the one after that, and so one.
+It has been empirically observed that most interactive workloads have approximations of a Zipfian/Zeta distribution of retrievals and updates to documents. This means the most popular document is retrieved/updated 2x more than the next most popular, 3x more than the next after that, 4x more the one after that, and so on.
 
-The generational storage system attempts to group documents into generations of "hotness", where the most updated documents stay in the smallest, hottest and most frequently compacted generation, colder documents tend  to migrate down to the next exponentially larger, colder generation (which because it's updated less frequently is compacted less frequently), and the colder still documents migrate down to the next exponentially larger, colder, less frequently compacted generation, and so on.
+The generational storage system attempts to group documents into generations of "hotness", where the most updated documents stay in the smallest, hottest and most frequently compacted generation, colder documents tend to migrate down to the next exponentially larger, colder generation (which because it's updated less frequently is compacted less frequently), and the colder still documents migrate down to the next exponentially larger, colder, less frequently compacted generation, and so on. The larger and colder the generation, the less frequently it's compacted, greatly reducing compaction costs.
+
+Generational storage also has the advantage of larger bulk write for each colder generation, reducing btree fragmentation and garbage, and improving locality of documents, especially useful when performing by\_seq scans as documents are more likely to be contiguous, making read ahead highly advantageous for SSD and especially for HDDs. Also it's possible to preallocate the storage needed to support the bulk transaction, reducing file system fragmentation, again highly advantageous requiring fewer block "extents" mappings and less seeks for HDDs.
 
 When workloads where many documents have widely ranging update frequencies (such as Zipfian) the frequency of update of a document (it's "hotness") determines the generation the document migrates to, and how therefore how frequently it gets compacted.
 
 Some key properties we want to maintain when working with a interactive/Zipfian workloads:
 
 * Consistent low latency durable writes/updates and fetches
-* Storage immune to corruption due to process/OS crash or powerloss
+* Storage immune to corruption due to process/OS crash or power loss
 * Fast startup and warmup time
 * High throughput, restartable by\_seq scans when indexing, replicating, rebalancing or backing-up a large amounts of changes
-* Partition level MVCC for reads and consistency of indexing and replication (necessary for UPR)
-* Efficient partition rebalance in and out.
-* Cost of rebalancing a partition onto and off of a node is the same regardless the number/size of other partitions on a node
-* Reduce the overhead necessary for compaction.
-* Pauseless compaction (files are compacted, reorganized, and defragmented without pausing updates or fetches)
+* Partition level MVCC for reads and consistency of indexing and replication (necessary for UPR), and whole database MVCC for point-in-time backups.
+* Efficient partition rebalance, both in and out of a node.
+* Cost of rebalancing a partition in and out of a node is the same regardless the number/size of other partitions on a node
+* Low overhead and frequency of compaction.
+* Pauseless compaction (files are compacted, reorganized, and defragmented without pausing durable writes or fetches)
 * Low diskspace overhead (disk space usage isn't dominated by internal fragmentation or index overhead)
 
 # System Architecture
@@ -170,15 +172,15 @@ On startup, the WAL file or files are read from beginning to end into memory, wi
 
 The advantage of the WAL is to reduce the latency of a durable commits, as it only has to wait on a single fsync of a sequential write for all partitions, instead of an fsync per partition, which can increase latency dramatically.
 
-The downside is the every document commit in the worst case will written to disk at least 2 times, once to the log and at least once in the partition specific generational storage, increasing disk contention and reducing throughput from it's theoretical maximum. For documents that are updated constantly, the number of times a write is rewritten can be much smaller, as only the most recent commit is copied the partition storage, the rest are ignored.
+The downside is the every document commit in the worst case will written to disk 2 times, once to the log and at least once in the partition specific generational storage, increasing disk contention and reducing throughput from it's theoretical maximum. For subsets of documents that are updated constantly, the number of times rewritten can be much smaller than 2 (but greater than 1), as only the most recent commit is copied the partition storage, the rest are ignored and discarded.
 
 ### Async Copy from WAL to Partition Storage
 
-Asynchronous to WAL commits, a separate process or thread will copy the most recent versions of data from memory to the youngest generation of partition specific storage. When this process starts, writes to the most recent (highest numbered) log file cease and new writes happen to a new high numbered log file. Once the partition copy process has copied all the live data from that log file to their specific partition storage, that log file is deleted. The process then begins again with next highest numbered log file, until no more mutations remain.
+Asynchronous to WAL commits, a separate process or thread will copy the most recent versions of data from memory to the youngest generation of partition specific storage. When this process starts, writes to the most recent (highest numbered) log file cease and new writes happen to a new high numbered log file. Once the partition copy process has copied all the live data from that log file to their specific partition storage, that log file is deleted. The process then begins again with next highest numbered log file, until no more mutations remain, or happening continuously if there is a continuous write load.
 
 ### Natural Throttle
 
-While it is copying files from the log to storage, it might need to recopy data from a younger generation to an older generation and/or in-place compact any of the generational files. When this happens, the copy/compaction process may get behind the update/insert rate of the log files. If this happens for too long, all the bucket memory quota will be dedicated to "dirty" items (even though they are safe on disk) and it will pause updates. which as the bucket will exceed it's memory quota therefore will not be able to accept any client writes, until the  items in memory are marked as permanently persisted.
+While it is copying files from the log to storage, it might need to recopy data from a younger generation to an older generation and/or in-place compact any of the generational files. When this happens, the copy/compaction process may get behind the update/insert rate of the log files. If this happens for too long, all the bucket memory quota will be dedicated to "dirty" items (even though they are safe on disk) and it will pause updates as the bucket will therefore will not be able to accept any client writes, until the  items in memory are marked as permanently persisted (moved from the WAL to partition storage).
 
 ## Generational Storage for Partitions
 
@@ -186,43 +188,53 @@ We now introduce the concept of Generational Storage (GS) For each partition tha
 
 Initial writes to GS occur at the smallest, and younger generation, until that generation exceeds it's live data size threshold, then the coldest documents (least recently or least frequently updated) documents are copied to the next colder generation, and the hottest documents are compacted in place for the same generation, or dropped if it can be determined a more recent version is in a hotter generation. This processes is repeated recursively until a generation is reached that is under it's live data threshold.
 
-
-
 ### Zipfian Update Workloads
 
-GS write performance is optimizing for workloads where there is a Zipfian distribution of update frequency. That is , over any given period of time, the 1st most updated document is updated 2x more times than the 2nd, and 3x more than the 3rd, and 4x more than the forth, and so on.
+GS write performance is optimizing for workloads where there is a Zipfian distribution of update frequency. That is, over any given period of time, the 1st most updated document is updated 2x more times than the 2nd, and 3x more than the 3rd, and 4x more than the forth, and so on.
 
-For a perfect zipfian update distribution, and a perfect "hotness-detection" of documents, GS will be a nearly ideal tradeoff, keeping IO costs per document update to the bare minimum. Even for workloads where there distribution isn't completely zipfian, but instead there are large groupings of documents with zimilar update frequencies, GS will still tend to group documents of similar hotness into one of more generations.
+For a perfect zipfian update distribution, and a perfect "hotness-detection" of documents, GS will be a nearly ideal tradeoff, keeping IO costs per document update to the bare minimum. Even for workloads where there distribution isn't completely zipfian, but instead there are varied groupings of documents with similar update frequencies, GS will still tend to group documents of similar hotness into one of more generations.
 
-Consider a database where 50% of the documents are consistently updated 2x more often than the remaining 50%, those documents will tend to stay in the hotter generations that can contain them (with perhaps a poor distribution among those generations), and the coldest will tend to stay in the coldest generation, thereby reducing the compaction frequency of the colder documents and improving IO costs substantially.
+Consider a database where 50% of the documents are consistently updated 2x more often than the remaining 50%, those documents will tend to stay in the hotter generations that can contain them (with perhaps a poor distribution among those generations), and the coldest will tend to stay in the coldest generation, thereby reducing the compaction frequency of the cold documents and improving IO costs substantially.
 
 ### Zipfian Read Workloads
 
-If there is a strong correlation between how often a document is updated and how often it's read, GS will also provide much cheaper disk based accesses for document more frequently accessed.
+A large RAM cache will improve this dramatic performance for a working set that can fit into it entirely, but if not large enough and if there is a strong correlation between how often a document is updated and how often it's read, GS will also provide much cheaper disk based accesses for documents more frequently accessed.
 
-However if there is little connection between updates and reads, generational storage will offer slightly less fetch efficiency over a single storage file (due to slightly more btree nodes necessary), or theoretically a storage scheme that optimizes disk layout for read frequency. 
+However if there is little connection between updates and reads, generational storage will offer slightly less fetch efficiency over a single storage file (due to statistically more btree nodes reads necessary), or theoretically a storage scheme that optimizes disk layout for read frequency (such as traditional balanced btrees).
 
 Combined with per-generation bloom filters, efficiencies similar to a single storage file can be obtained (with a memory and disk space overhead of maintaining the bloom filter), and will be always be in the order O(logN) as a single file.
 
 ### Optimizing "Coldness"-detection
 
-A key to optimizing GS for zipfian workloads is to ensure the reasonable ranking of the "hotness" of documents and migrating and keeping at appropriate generation. Perfect ranking requires future knowledge of update patterns, which is NP-hard (http://www.cse.msu.edu/~torng/Research/Pubs/offline-cache-paper.pdf), but heuristics will be employed and can be compared against a theoretically maximum efficiency. The closer to a maximum the heuristic performs for a workload, the better the heuristic when ranked against other heuristics. Also, the cost of the heuristic, by space, IOPs, CPU and latency, must be balanced for best server performance.
+A key to optimizing GS for zipfian workloads is to ensure the reasonable ranking of the "hotness" of documents and migrating and keeping at the appropriate generation. Perfect ranking requires future knowledge of update patterns, which is NP-hard (http://www.cse.msu.edu/~torng/Research/Pubs/offline-cache-paper.pdf), but heuristics will be employed and can be compared against a theoretically maximum efficiency. The closer to a maximum the heuristic performs for a workload, the better the heuristic when ranked against other heuristics. Also, the cost of the heuristic, by space, IOPs, CPU and latency, must be balanced for best server performance.
 
-A simple but serviceable heuristic is a Least Recently Updated scheme. For any generation file, the documents are arranged by\_seq order, with the most recently updated documents having the highest seq. When exceeding the size threshold, simply copy the lowest seq of the documents to the next generation, and keep rest in the current generation. Determining the optimal percentage of documents to move the larger generation vs. keeping in the current is also NP-hard. Reasonable defaults can be determined via empirical means and made configurable for different workloads.
+A simple but serviceable heuristic is a Least Recently Updated scheme. For any generation file, the documents are arranged by\_seq order, with the most recently updated documents having the highest seq. When exceeding the size threshold, simply copy the documents with the lowest seq (LRU) to the next generation, and keep rest in the current generation. Determining the optimal percentage of documents to move the larger generation vs. keeping in the current is also NP-hard. Reasonable defaults can be determined via empirical means and made configurable for different workloads.
 
-The efficiency of the heuristic depends a great deal on the exact workload patterns, and how favorably it compares to other schemes for a those patterns. Devising alternative heuristics is outside the scope of this document, but statistics based heuristics are likely to play in role in future versions, in much the same way statistics based query optimizers play an important role in modern RDBMS systems.
+The efficiency of the heuristic depends a great deal on the exact workload patterns, and how favorably it compares to other schemes for those patterns. Devising alternative heuristics is outside the scope of this document.
+
+### Storage File Naming
+
+All generation storage files for a node will be stored in a single directory, with naming convention as follows:
+
+%PartitionNumber%-%GenerationLevel%-%CompactionVersion%.cb
+
+ParitionNumber is an integer between 0 and the (total number of partitions) - 1. It represents the partition the storage file belongs to.
+
+GenerationLevel is a monotonically increasing integer 0 to G, where G is coldest, largest generation. There will never be gaps between generations, if generation 5 exists, so must 4, 3, 2, 1 and 0.
+
+CompactionVersion is a monotonically increasing integer N that is the same as the number of times the generation has been compacted in-place. For a small window of time as compaction completes, there will be 2 files, the older file being N and the new file being N+1. Once N+1 is in place, the older file N will be deleted.
 
 ### Generation File Degradation
 
 As generations get insertions, updates, and deletions, they tend to degrade in performance and storage efficiency. This is due to several factors:
 
 * Wasted Space - For every document update or deletion, there is now wasted space of a previous version that is occupying disk space.
-* Fragmentation - The wasted space, when it occurs between 2 live documents, increases cost of reading the live documents when scanning the documents in by\_seq order, as reading the 2 live documents will either have to also read any wasted space at the file system block level at the end of the first document and at the beginning of the second document, or perform a costly seek to skip over the wasted space. For SSDs the seeks aren't as much a concern except for wasted read-ahead cost that's often performed at various FS cache levels, and for HDDs, the cost is greater on average as it can involved a physical disk head arm movement  (though the ordered nature of the document updates tend toward smaller arm movements).
-* Poorer btree node locality. Each update to the generation means btree nodes must rewritten at the end of the file, meaning poorer locality for some branches of the btree, and for node not in cache this can entail expensive disk head arm movements.
-* Unbalanced Btree Nodes - For certain update patterns, the deletion of old by\_seq entries for new entries mean the btree nodes can shrink deteriorate from their ideal balance of the same depth for all leaf nodes with a worst case access cost of O(logN) to all nodes, to an absolute worst case of linear cost O(N) to some leafs nodes.
+* Fragmentation - The wasted space, when it occurs between 2 live documents, increases cost of reading the live documents when scanning the documents in by\_seq order, as reading the 2 live documents will either have to also read any wasted space at the file system block level at the end of the first document and at the beginning of the second document, or perform a costly seek to skip over the wasted space. For SSDs the seeks aren't as much a concern except for wasted read-ahead cost that's often performed at various FS cache levels, and for HDDs, the cost is often greater as it can involved a physical disk head arm movement  (though the ordered nature of the document on disk tend toward smaller arm movements).
+* Poorer btree node locality. Each update to the generation means btree nodes must rewritten at the end of the file, meaning poorer locality for some branches of the btree, and for nodes not in cache this can entail expensive disk head arm movements.
+* Unbalanced Btree Nodes - For certain update patterns, the deletion of old by\_seq entries for new entries mean the btree nodes can  deteriorate from their ideal balance of the same depth for all leaf nodes with a worst case access cost of O(logN) to all nodes, to an absolute worst case of linear cost O(N) to some leafs nodes.
 * Higher false hit ratios of the bloom filters. When a generation is newly created, the bloom filters will have their lowest average false positive rate. As new documents are added to the generation, the false positive rate will increase.
 
-However, the process of compaction will restore the storage generation to optimal btree layouts, an optimal bloom filter, with no wasted space from garbage documents or btree nodes.
+However, the process of compaction will restore the storage generation to optimal btree layouts, an optimal bloom filter, with no wasted space from garbage documents or btree nodes. This limits the total degradation possible for a storage generation.
 
 ### Batch Inserts, Better data locality per generation
 
@@ -232,16 +244,16 @@ This is because the rate at which documents and btree nodes become fragmented ar
 
 When copying documents to a colder generation from hotter generation, the documents are batched in a single transaction, guaranteeing sequential packing of those new updates and excellent locality of the rewritten btree nodes, and minimizing wasted btree nodes.
 
-Since this always happens in batches, this a big improvement over the single document non-batched updates that can be happening at the hottest level, which if happens on a single, monolithic storage file means each document is non-sequential to other updates, as each updates places rewritten btree nodes and a header between each document. Single updates will also rewrite more btree nodes, 0(Mlog(N)) for each of M updates for N total documents vs expected cost for the batched update.
+Since this always happens in batches, this a big improvement over the single document non-batched updates that can be happening at the hottest level, which if happens on a single, monolithic storage file means each document is non-sequential to other updates, as each updates places rewritten btree nodes and a header between each document. Single updates will also rewrite more btree nodes.
 
 
 ## Partition Specific Meta-data
 
 The smallest generation will contain the meta information pertaining to an entire partition, and will be read and stored in-memory on startup.
 
-Statistics that will be stored are total live documents, total deleted documents, total documents in conflict.
+Statistics that will be stored in the partition header are total live documents, total deleted documents, total documents in conflict.
 
-Each generation's file header will contain information about the total document count and size of live data and btree nodes in the generation. However, this data isn't useful in aggregate across generations, as data in hotter generations may overwrite or delete data in older generation. Per generation metadata is only useful for determining when to compact a generation due to fragmentation.
+Each generation's file header will contain information about the total document count and size of live data and btree nodes in the generation. However, this data isn't useful in aggregate across generations, as data in hotter generations may overwrite or delete data in older generations. Per generation metadata is only useful for determining when to compact a generation due to fragmentation.
 
 ## Performing an Insert, Update or Deletion
 
@@ -252,11 +264,11 @@ When performing a mutation, if the document's metadata isn't already in RAM cach
 The most recent document metadata (the one in the smallest generation) will contain the revision tree history for all conflicts and be cached in memory. This meta data will contain:
 
 * the revision history of each conflict
-* For conflicts residing in the same file, the exact file offset to load the document.
-* For conflicts residing in the larger generations, it will contain the by sequence update.
-* a flag to indicate if a conflict is deleted or a live.
+* For conflicts residing in the same file, the exact file offset to fetch the document.
+* For conflicts residing in the larger generations, it will contain the conflict update seq.
+* A flag to indicate if a conflict is deleted or a live.
 
-NOTE: Under most circumstances there will be no conflicts. Just consider the single document as "conflict" in this context to make the algorithm easier to understand.
+NOTE: Under many circumstances there will be no real conflicts. But consider even a single document with no other conflicts as a "conflict" in this context to make the algorithm easier to understand.
 
 If using a CAS, the document mutation is the applied to the meta using CAS to find the appropriate conflict. If it's not found or doesn't match, the document is rejected and an error is returned the client.
 
@@ -264,8 +276,7 @@ If the CAS matches or isn't used, the document and updated metadata is then writ
 
 A background process then writes the updated document(s) and metadata into the smallest generation file. When the generation exceeds it's live data threshold, the coldest documents are copied to the next colder generation, the hotter documents are written to a new file of the same generation level.
 
-When writing data from a smaller generation to a larger generation, or compacting in place (or doing both), the original file cannot be deleted until all data is written to the next generation and to the compacted current file. For a short time, the document will be in both places.
-
+When writing data from a smaller generation to a larger generation, or compacting in place (or doing both), the original file cannot be deleted until all data is written to the next generation and to the compacted current file. Until completion and the old file deleted, the same document will be in both places.
 
 ### Dealing with a conflict
 
@@ -273,15 +284,23 @@ When writing data from a smaller generation to a larger generation, or compactin
 
 ## Single vs. Double fsync
 
-The single fsync enhancement for commits and headers can make commits to a storage file much faster, with the cost that on start up, all contents written the last segment of a storage file, between the last and second to last header, must be checked for integrity.
+The single fsync enhancement for commits and headers can make commits to a storage file faster, with the cost that on start up, all contents written the last segment of a storage file, between the last and second to last header, must be checked for integrity.
 
-But for generational storage, each commit to larger, colder generations is the result of a single large batched update from a smaller generation. If we have no need to read all the data on start-up on those files (like for 2.0 warmup), we will there be wasting unbounded amounts of disk IO and cpu and time checking the last commits of all generations, reducing availability of a node. Therefore all generations, except perhaps the very youngest, should be use the double fsync method, with data first, then the header.
+But for generational storage, each commit to larger, colder generations is the result of a single large batched update from a smaller generation. If we have no need to read all the data on start-up on those files (like for 2.0 warmup), we will there be wasting unbounded amounts of disk IO and cpu and time checking the last commits of all generations, increasing startup time and reducing availability of a node. Therefore all generations, except perhaps the very youngest, should be use the double fsync method, with data fsync'd first, then the header.
 
-## Live Data Threshold
+## Live Data Threshold Exceeded
 
+As each storage generation keeps statistics about the size of all live btree nodes and documents, it's possible to know how much live data and metadata is in a file and if it's exceed the generation's threshold. If it does, the coldest documents will be copied to the next coldest generation and the remaining will be copied to a new storage file of the same generation.
 
+When this is done, the old file is still accessible until the all the documents are copied to the next colder generation and the current generation file is generated. It is then deleted and inaccessible to new readers, and current readers will still have access to the old file until they close their file descriptor, when then will cause the OS to completely unlink the file and recover the wasted space.
 
-### Growth and copying
+## Compaction Threshold Exceeded
+
+To determine how much space is in a storage file is garbage done simply by subtracting the live data size from the total file size. If the garbage exceeds the configurable ratio, then the file is compacted in place.
+
+As with the Live Data Threshold, the coldest documents can be copied to the next colder generation. Or none at all. The amount copied to the colder generation during compaction should be configurable.
+
+As with the Live Data Threshold process, the original file is kept around until all data is copied to the new file and colder generation, when it is then deleted.
 
 ## MVCC
 
