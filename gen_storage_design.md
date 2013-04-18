@@ -95,16 +95,6 @@ Because of the tail-append nature, any update to that fails to complete will als
 
 Currently Couchstore and CouchDB do 2 fsyncs to ensure the database can never be corrupted. First they fsync all data and btree writes to disk, and then write the new header (at the end of the file) to point to the newly updated btrees.
 
-### Reducing fsyncs
-
-If for single or batched update, if we write all the data, btree updates and header and then do a single fsync, when the fsync successfully returns everything will correct on disk. 
-
-However, there is a small possibility the OS will reorder how it durably writes the files to disk, and can write out the header before other data in the same commit. If a crash or powerloss occurs during this reordered writes, on restart it's possible the system will find and use this header that eventually points to incompletely written data, which results in the same problems a data corruption. It's possible a single document is corrupted, or the root of a btree, making it impossible to access any document in the database. It won't know the data is corrupted until sometime later when it tries to read these incomplete items.
-
-A simple enhancement is use a single fsync scheme for a commit, and when a server opens a database file for the first time after startup, it scans and reads all data, meta, and btree nodes whose file location is _after_ the previous header, but _before_ the current header. If any data is detected as corrupt (fails the CRC32 check), is instead uses the previous header as the correct header and truncates the file directly after it, effectively detecting and removing the incomplete transaction.
-
-The tradeoff is we now half the fsyncs, but we must scan all data and meta from the last transaction on startup. Fortunately all the data is in a single contiguous region on disk, greatly reduce the seek cost if the area is prefetched.
-
 ## MVCC
 
 When updates occurs, any existing on-disk data and metadata aren't modified. This means MVCC snapshotting of the entire database file is automatic and essentially free, requiring no explicit locks or resources beyond what a single threaded access require, as reads to the database can happen concurrently with writes, with no hard limit on the number of concurrent read snapshots. With a shared file cache, each concurrent reader often uses less resources per-snapshot (file system cache memory and disk fetches).
@@ -137,7 +127,7 @@ Also, there is worst case of compaction, where a single document in a large part
 
 The best case for compaction is when there is a even distribution of single updates across all documents.
 
-# Generational Storage
+## Generational Storage
 
 Generational Append-Only Storage is a new design that is heavily based on the current Couchstore design, and addresses many of the shortcomings, particularly for interactive workloads.
 
@@ -303,10 +293,19 @@ That is solved with two different mechanisms:
 
 ## Single vs. Double fsync
 
+### Reducing fsyncs
+
+If for single or batched update, if we write all the data, btree updates and header and then do a single fsync, when the fsync successfully returns everything will correct on disk. 
+
+However, there is a small possibility the OS will reorder how it durably writes the files to disk, and can write out the header before other data in the same commit. If a crash or powerloss occurs during this reordered writes, on restart it's possible the system will find and use this header that eventually points to incompletely written data, which results in the same problems a data corruption. It's possible a single document is corrupted, or the root of a btree, making it impossible to access any document in the database. It won't know the data is corrupted until sometime later when it tries to read these incomplete items.
+
+A simple enhancement is use a single fsync scheme for a commit, and when a server opens a database file for the first time after startup, it scans and reads all data, meta, and btree nodes whose file location is _after_ the previous header, but _before_ the current header. If any data is detected as corrupt (fails the CRC32 check), is instead uses the previous header as the correct header and truncates the file directly after it, effectively detecting and removing the incomplete transaction.
+
+The tradeoff is we now half the fsyncs, but we must scan all data and meta from the last transaction on startup. Fortunately all the data is in a single contiguous region on disk, greatly reduce the seek cost if the area is prefetched.
+
 The single fsync enhancement for commits and headers can make commits to a storage file faster, with the cost that on start up, all contents written the last segment of a storage file, between the last and second to last header, must be checked for integrity.
 
 But for generational storage, each commit to larger, colder generations is the result of a single large batched update from a smaller generation. If we have no need to read all the data on start-up on those files (like for 2.0 warmup), we will there be wasting unbounded amounts of disk IO and cpu and time checking the last commits of all generations, increasing startup time and reducing availability of a node. Therefore all generations, except perhaps the very youngest, should be use the double fsync method, with data fsync'd first, then the header.
-
 
 ## Compaction and Spillover
 
