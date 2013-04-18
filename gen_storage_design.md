@@ -105,7 +105,7 @@ The efficiency of snapshotting is particularly important when performing range s
 
 Compaction is the process of recovering wasted space in a storage file and arranging all the live data in a and btrees to be optimized for size and arrangement. It copies all data and btree indexes from the old file to a new file. It does this without without stopping or pausing persistence and fetches, but can result in duplicate IO for writes that occurred during the compaction.
 
-The compaction doesn't block reads or writes, letting them proceed normally, though possibly slowed through increased io bandwith of the copying process.
+The compaction doesn't block reads or writes, letting them proceed normally, though possibly slowed through increased io utilization of the copying process.
 
 The compaction process scans the by\_seq index and load all the live documents from the database and copying them into a new file. It creates a by\_seq index bottom up in the new file by building the node the leafs up to the root node, the sorts the same information by key/id with on-disk heap sort, and then builds up the new by\_id btree from the bottom up.
 
@@ -119,13 +119,15 @@ In CouchDB, all documents for a database are written to a single storage file, m
 
 In Couchbase 2.0 all documents are written to a partition specific storage file, and with 1024 partitions it effectively solves the free space problem with compaction as it is now far more incremental (each unit of compaction work is 1/1024 of the total dataset) and therefore needs much less temporary disk space or memory.
 
-It also makes it easy to read, write or delete many or all documents from a partition more efficiently, as is the case for rebalances. Documents grouped by partition have better locality for scans, writing in bulk doesn't cause extra IO in other partitions, and deleting a partition is simply deleting the storage file as a single operation.
+It also makes it easy to read, write or delete many or all documents from a partition more efficiently, as is the case for rebalances. Documents grouped by partition have better locality for scans, writing in bulk doesn't cause extra compaction or migration IO in other partitions, and deleting a partition is simply deleting the storage file as a single operation.
 
-But the Couchbase storage this introduces a new problem, to durably committing a large number of documents to different partitions requires at a minimum 1 fsync per partition, greatly increasing latency for a durable commit.
+But for Couchbase 2.0 storage this introduces a new problem, to durably committing a large number of documents to different partitions requires at a minimum 1 fsync per partition, greatly increasing latency for a durable commit.
 
-Also, there is worst case of compaction, where a single document in a large partition is updated repeatedly. Recovering the garbage space from the updates means copying all documents in the partition to a new file, even the documents that haven't been updated in a very long time. The cost of compaction is O(N*Log(N)) for N total documents in the partition, even though only 1 document is being updated. The cost of recovering the space for 1 document is O(N\*log(N)), where N is the total number of documents.
+The cost of compaction per document updated is 0((N*log(N))/M) where N is the total number of document and M is total number of unique documents updated between compactions.
 
-The best case for compaction is when there is a even distribution of single updates across all documents.
+The worst case cost of compaction is where a single document in a large partition is updated repeatedly. Recovering the garbage space from the updates means copying all documents in the partition to a new file, even the documents that haven't been updated in a very long time.
+
+The best case for compaction is when there is a distribution of single updates across all documents, so as M becomes large and approaches N, the cost become O(log(N)) per unique document update.
 
 ## Generational Storage
 
