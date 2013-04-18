@@ -190,7 +190,7 @@ Consider a database where 50% of the documents are consistently updated 2x more 
 
 ### Zipfian Read Workloads
 
-A large RAM cache will improve this dramatic performance for a working set that can fit into it entirely, but if not large enough and if there is a strong correlation between how often a document is updated and how often it's read, GS will also provide much cheaper disk based accesses for documents more frequently accessed.
+A large RAM cache will improve the performance for a working set that can fit into it entirely, but if not large enough and if there is a strong correlation between how often a document is updated and how often it's read, GS will also provide much cheaper disk based accesses.
 
 However if there is little connection between updates and reads, generational storage will offer slightly less fetch efficiency over a single storage file (due to statistically more btree nodes reads necessary), or theoretically a storage scheme that optimizes disk layout for read frequency (such as traditional balanced btrees).
 
@@ -315,13 +315,15 @@ But for generational storage, each commit to larger, colder generations is the r
 
 As each storage generation keeps statistics about the size of all live btree nodes and documents, it's possible to know how much live data and metadata is in a file and if it's exceed the generation's threshold. If it does, the coldest documents will be copied to the next coldest generation and the remaining will be copied to a new storage file of the same generation.
 
+We also copy all by\_seq tombstones and by\_seq updates to the next colder generation.
+
 When this is done, the old file is still accessible until the all the documents are copied to the next colder generation and the current generation file is generated. It is then deleted and inaccessible to new readers, and current readers will still have access to the old file until they close their file descriptors, which then will cause the OS to completely unlink the file and recover the wasted space.
 
 ### Garbage Threshold Exceeded
 
 To determine how much space is in a storage file is garbage is done simply by subtracting the live data size from the total file size. If the garbage exceeds the configurable ratio, then the file is compacted in place.
 
-As with the Live Data Threshold, the coldest documents can be copied to the next colder generation. Or none at all. The amount copied to the colder generation during compaction should be configurable.
+As with the Live Data Threshold, the coldest documents can be copied to the next colder generation. Or none at all. The amount of cold data copied to the colder generation during compaction should be configurable. Also all by\_seq tombstones and updates are always copied.
 
 As with the Live Data Threshold process, the original file is kept around until all data is copied to the new file and colder generation, when it is then deleted.
 
@@ -331,7 +333,7 @@ Each Generational Storage File will have a bloom filter generated from the hashe
 
 When a write to a storage file occurs, the entire bloom filter is rewritten at the end of the file. It can be stored inside the header.
 
-With the larger, colder generation files, the bloom filter can be very large. Approximately 9 bits per document stored for a bloom filter with 1% false positive rate. However, the cost of rewriting the whole header will generally be offset of the bulk writes to the file, since the each update will be due relatively large amount of documents migrating from hotter storage to colder. So the space and IO cost per document updated will be still be small.
+With the larger, colder generation files, the bloom filter can be very large. Approximately 9 bits per document stored for a bloom filter with 1% false positive rate. However, the cost of rewriting the whole header will generally be offset by the cost of the bulk writes to the file, since the cost each update will be due relatively large amount of documents migrating from hotter storage to colder. The colder the file, the larger the bulk update and the larger the bloom fliter, so the amortized cost of rewriting the bloom filter per doc migrated should remain consistent and relatively small at all levels.
 
 ### False Positive Degradation and Regeneration
 
