@@ -152,7 +152,7 @@ When workloads where many documents have widely ranging update frequencies (such
 Some key properties we want to maintain when working with a interactive/Zipfian workloads:
 
 * Consistent low latency durable writes/updates and fetches
-* Storage immune to corruption due to process/OS crash or power loss
+* Durable storage immune to corruption due to process/OS crash or power loss
 * Fast startup and warmup time
 * High throughput, restartable by\_seq scans when indexing, replicating, rebalancing or backing-up a large amounts of changes
 * Partition level MVCC for reads and consistency of indexing and replication (necessary for UPR), and whole database MVCC for point-in-time backups.
@@ -168,25 +168,25 @@ Some key properties we want to maintain when working with a interactive/Zipfian 
 
 All commits to storage are written to an index-less, tail-append write ahead log (WAL) file. There are a series of these files numbered from 0 and up (0.log, 1.log ... _N_.log), and all new mutations happen to the highest numbered file. Until the data is moved to partition specific storage, the most recent update to a document is kept in memory (as dirty) and cannot be ejected. However, once written and persisted to the log, a client waiting for the write to be durable will get the success response from the server.
 
-On startup, the WAL file or files are read from beginning to end into memory, with subsequent updates to the same document replacing in the in-memory representation of the earlier mutation. These newly read document are still marked dirty until they are written and committed to partition specific storage.
+On startup, the WAL file or files are read from beginning to end into memory, with subsequent updates to the same document replacing in the in-memory representation of the earlier mutation. These newly read documents are still marked un-ejectable from RAM until they are written and committed to partition specific storage.
 
-The advantage of the WAL is to reduce the latency of a durable commits, as it only has to wait on a single fsync of a sequential write for all partitions, instead of an fsync per partition, which can increase latency dramatically.
+The advantage of the WAL is to reduce the latency of a durable commit, as it only has to wait on a single fsync of a sequential write for all partitions, instead of an fsync per partition, which can increase latency dramatically.
 
-The downside is the every document commit in the worst case will written to disk 2 times, once to the log and at least once in the partition specific generational storage, increasing disk contention and reducing throughput from it's theoretical maximum. For subsets of documents that are updated constantly, the number of times rewritten can be much smaller than 2 (but greater than 1), as only the most recent commit is copied the partition storage, the rest are ignored and discarded.
+The downside is the every document commit in the worst case will be written to disk 2 times, once to the log and at least once in the partition specific generational storage, increasing disk contention and reducing throughput from it's theoretical maximum. For subsets of documents that are updated constantly, the number of times rewritten can be much smaller than 2 (but always greater than 1), as only the most recent commit is copied the partition storage, the rest are ignored and discarded.
 
 ### Async Copy from WAL to Partition Storage
 
 Asynchronous to WAL commits, a separate process or thread will copy the most recent versions of data from memory to the youngest generation of partition specific storage. When this process starts, writes to the most recent (highest numbered) log file cease and new writes happen to a new high numbered log file. Once the partition copy process has copied all the live data from that log file to their specific partition storage, that log file is deleted. The process then begins again with next highest numbered log file, until no more mutations remain, or happening continuously if there is a continuous write load.
 
-### Natural Throttle
+### Natural Write Throttle
 
-While it is copying files from the log to storage, it might need to recopy data from a younger generation to an older generation and/or in-place compact any of the generational files. When this happens, the copy/compaction process may get behind the update/insert rate of the log files. If this happens for too long, all the bucket memory quota will be dedicated to "dirty" items (even though they are safe on disk) and it will pause updates as the bucket will therefore will not be able to accept any client writes, until the  items in memory are marked as permanently persisted (moved from the WAL to partition storage).
+While it is copying files from the log to storage, it might need to recopy data from a younger generation to an older generation and/or in-place compact any of the generational files. When this happens, the copy/compaction process may get behind the update/insert rate of the log files. If this happens for too long, all the bucket memory quota will be dedicated to un-ejectable items (even though they may be safe on disk) and it will pause client updates as the bucket will not be able to accept any client writes, until the items in memory are marked as permanently persisted (moved from the WAL to partition storage).
 
 ## Generational Storage for Partitions
 
 We now introduce the concept of Generational Storage (GS) For each partition that a bucket is responsible for, either as a master or replica/backup, it will contain a series of Append-Only storage files, which independently look and behave very much like 2.0 Couchstore partition storage. Unlike 2.0 storage, there isn't one big file that contains all data for that partition, but instead contain a series of files arranged in generations, each being exponentially larger than previous generation.
 
-Initial writes to GS occur at the smallest, and younger generation, until that generation exceeds it's live data size threshold, then the coldest documents (least recently or least frequently updated) documents are copied to the next colder generation, and the hottest documents are compacted in place for the same generation, or dropped if it can be determined a more recent version is in a hotter generation. This processes is repeated recursively until a generation is reached that is under it's live data threshold.
+Initial writes to GS occur at the smallest and youngest generation, until that generation exceeds it's live data size threshold, then the coldest documents (least recently or least frequently updated) documents are copied to the next colder generation, and the hottest documents are compacted in place for the same generation, or dropped if it can be determined a more recent version is in a hotter generation. This processes is repeated recursively until a generation is reached that is under it's live data threshold.
 
 ### Zipfian Update Workloads
 
@@ -206,7 +206,7 @@ Combined with per-generation bloom filters, efficiencies similar to a single sto
 
 ### Optimizing "Coldness"-detection
 
-A key to optimizing GS for zipfian workloads is to ensure the reasonable ranking of the "hotness" of documents and migrating and keeping at the appropriate generation. Perfect ranking requires future knowledge of update patterns, which is NP-hard (http://www.cse.msu.edu/~torng/Research/Pubs/offline-cache-paper.pdf), but heuristics will be employed and can be compared against a theoretically maximum efficiency. The closer to a maximum the heuristic performs for a workload, the better the heuristic when ranked against other heuristics. Also, the cost of the heuristic, by space, IOPs, CPU and latency, must be balanced for best server performance.
+A key to optimizing GS for zipfian workloads is to ensure the reasonable ranking of the "hotness" of documents and migrating and keeping at the appropriate generation. Perfect ranking requires future knowledge of update patterns, which is NP-hard (http://www.cse.msu.edu/~torng/Research/Pubs/offline-cache-paper.pdf), but heuristics will be employed and can be compared for  efficiency. The cost of the heuristic -- including space, IOPs, CPU and latency -- must be balanced for general server performance.
 
 A simple but serviceable heuristic is a Least Recently Updated scheme. For any generation file, the documents are arranged by\_seq order, with the most recently updated documents having the highest seq. When exceeding the size threshold, simply copy the documents with the lowest seq (LRU) to the next generation, and keep rest in the current generation. Determining the optimal percentage of documents to move the larger generation vs. keeping in the current is also NP-hard. Reasonable defaults can be determined via empirical means and made configurable for different workloads.
 
@@ -218,11 +218,11 @@ All generation storage files for a node will be stored in a single directory, wi
 
 %PartitionNumber%-%GenerationLevel%-%CompactionVersion%.cb
 
-ParitionNumber is an integer between 0 and the (total number of partitions) - 1. It represents the partition the storage file belongs to.
+ParitionNumber is an integer between 0 and N - 1, where N is the total number of partitions. It represents the partition the storage file belongs to.
 
 GenerationLevel is a monotonically increasing integer 0 to G, where G is coldest, largest generation. There will never be gaps between generations, if generation 5 exists, so must 4, 3, 2, 1 and 0.
 
-CompactionVersion is a monotonically increasing integer N that is the same as the number of times the generation has been compacted in-place. For a small window of time as compaction completes, there will be 2 files, the older file being N and the new file being N+1. Once N+1 is in place, the older file N will be deleted.
+CompactionVersion is a monotonically increasing integer N that is the same as the number of times the generation has been compacted in-place. For a small window of time as compaction completes, there will be 2 files, the older file being N and the new file being N+1. Once version N+1 is in place, the older file N will be deleted.
 
 ### Generation File Degradation
 
@@ -231,21 +231,20 @@ As generations get insertions, updates, and deletions, they tend to degrade in p
 * Wasted Space - For every document update or deletion, there is now wasted space of a previous version that is occupying disk space.
 * Fragmentation - The wasted space, when it occurs between 2 live documents, increases cost of reading the live documents when scanning the documents in by\_seq order, as reading the 2 live documents will either have to also read any wasted space at the file system block level at the end of the first document and at the beginning of the second document, or perform a costly seek to skip over the wasted space. For SSDs the seeks aren't as much a concern except for wasted read-ahead cost that's often performed at various FS cache levels, and for HDDs, the cost is often greater as it can involved a physical disk head arm movement  (though the ordered nature of the document on disk tend toward smaller arm movements).
 * Poorer btree node locality. Each update to the generation means btree nodes must rewritten at the end of the file, meaning poorer locality for some branches of the btree, and for nodes not in cache this can entail expensive disk head arm movements.
-* Unbalanced Btree Nodes - For certain update patterns, the deletion of old by\_seq entries for new entries mean the btree nodes can  deteriorate from their ideal balance of the same depth for all leaf nodes with a worst case access cost of O(logN) to all nodes, to an absolute worst case of linear cost O(N) to some leafs nodes.
+* Unbalanced Btree Nodes - For certain update patterns, the deletion of old by\_seq entries for new entries mean the btree nodes can  deteriorate from their ideal balance of the same depth for all leaf nodes with a average case access cost of O(logN) to all nodes, to an absolute worst case of linear cost O(N) to some leafs nodes.
 * Higher false hit ratios of the bloom filters. When a generation is newly created, the bloom filters will have their lowest average false positive rate. As new documents are added to the generation, the false positive rate will increase.
 
 However, the process of compaction will restore the storage generation to optimal btree layouts, an optimal bloom filter, with no wasted space from garbage documents or btree nodes. This limits the total degradation possible for a storage generation.
 
 ### Batch Inserts, Better data locality per generation
 
-Another advantage of generational storage to a single generation storage is to reduce the rate of fragmentation of documents and btree nodes.
+Another advantage of generational storage to a single file storage is to reduce the rate of fragmentation of documents and btree nodes.
 
 This is because the rate at which documents and btree nodes become fragmented are highly affected by the batch size of documents (larger batches are better). The best case for batching is experienced with compaction, where all documents written to a new a file in a single batch, resulting in files that are sequentially packed together, and btree's nodes exhibiting ideal locality for random lookups and range scans.
 
 When copying documents to a colder generation from hotter generation, the documents are batched in a single transaction, guaranteeing sequential packing of those new updates and excellent locality of the rewritten btree nodes, and minimizing wasted btree nodes.
 
-Since this always happens in batches, this a big improvement over the single document non-batched updates that can be happening at the hottest level, which if happens on a single, monolithic storage file means each document is non-sequential to other updates, as each updates places rewritten btree nodes and a header between each document. Single updates will also rewrite more btree nodes.
-
+Since this always happens in batches, this a big improvement over the single document non-batched updates that can be happening at the hottest level, which if happens on a single, monolithic storage file means each document is non-sequential to other updates, as each update places rewritten btree nodes and a header between each document. Single updates will also rewrite more btree nodes than batched updates.
 
 ## Partition Specific Meta-data
 
@@ -259,28 +258,48 @@ Each generation's file header will contain information about the total document 
 
 All mutations to partition storage happen at the smallest generation. 
 
-When performing a mutation, if the document's metadata isn't already in RAM cache, check each generation from the smallest to largest, first checking each generation's bloom filter, then fetching the document and meta data via the by\_id btree (which might not find a result due to a bloom filter false positive), repeating until it finds the first occurrence of the document, if it exists at.
+When performing a mutation, if the document's metadata isn't already in RAM cache, check each generation from the smallest to largest, first checking each generation's bloom filter, then fetching the document and meta data via the by\_id btree (which might not find a result due to a bloom filter false positive), repeating until it finds the first occurrence of the document, if it exists at all.
 
 The most recent document metadata (the one in the smallest generation) will contain the revision tree history for all conflicts and be cached in memory. This meta data will contain:
 
-* the revision history of each conflict
+* The revision history of each conflict
 * For conflicts residing in the same file, the exact file offset to fetch the document.
-* For conflicts residing in the larger generations, it will contain the conflict update seq.
-* A flag to indicate if a conflict is deleted or a live.
+* For conflicts residing in the colder generations, it will contain the conflict update seq.
+* A flag to indicate if a conflict is deleted or live.
 
 NOTE: Under many circumstances there will be no real conflicts. But consider even a single document with no other conflicts as a "conflict" in this context to make the algorithm easier to understand.
 
-If using a CAS, the document mutation is the applied to the meta using CAS to find the appropriate conflict. If it's not found or doesn't match, the document is rejected and an error is returned the client.
+If using a CAS, the document mutation is the applied to the metadata using CAS to find the appropriate conflict. If it's not found or doesn't match, the document is rejected and an error is returned the client.
 
 If the CAS matches or isn't used, the document and updated metadata is then written to the most recent WAL file. If the CAS is omitted, the mutation is applied to the "winner" conflict.
 
 A background process then writes the updated document(s) and metadata into the smallest generation file. When the generation exceeds it's live data threshold, the coldest documents are copied to the next colder generation, the hotter documents are written to a new file of the same generation level.
 
-When writing data from a smaller generation to a larger generation, or compacting in place (or doing both), the original file cannot be deleted until all data is written to the next generation and to the compacted current file. Until completion and the old file deleted, the same document will be in both places.
+### by\_seq Tombstone
 
-### Dealing with a conflict
+If the mutation is an edit or deletion, the old by\_seq entry must be deleted. If the previous by\_seq entry is still in memory and WAL only and uncopied to generational storage, nothing needs to be done. If the previous generation is in generational storage or it's unknown if it's in generational storage (due to concurrent migration of the mutation from WAL to GS), then write a deletion "tombstone" for the by\_seq entry to be copied into generational storage.
 
-## Performing an Update
+The by\_seq tombstone will be copied and eventually be applied to the generation with the corresponding by\_seq entry, where it's then removed from the btree. If it makes it all the way to the coldest generation without finding it's corresponding by\_seq entry, the tombstone is dropped.
+
+When walking the logical by\_seq index, all generation files will be walked simultaneously, and tombstones encountered in hotter generations will cause the actual entry a colder generation to be skipped over.
+
+## Cumulative by\_id entry
+
+The by\_id entry for the document in the hottest generation contains the cumulative revision tree history for all conflicts. Each generation with a version of the document also has a by\_id entry that is the cumulative history for all colder generations. This is necessary so when the conflict status or winner changes, we know it at update time and can update flags and rewrite winners into the by\_seq and by\_id entries.
+
+### Updating Interim Winner and Conflict Markers
+
+Each conflict in the database has its own by\_seq entry. Each by\_seq entry for a document should know if the document is in conflict, and if the particular version is the interim winner or a conflict loser. This is because indexes want to only index the interim winner, and may want to know if the document is in conflict to allow quickly finding documents in conflict via the secondary index.
+
+For correctness purposes, it's good enough to ensure that interim winner always has a seq higher than any other conflict version, the indexer will overwrite any conflicts with the winner if it's always last. But for efficiency reasons, we'd like indexers to be able to skip conflict documents, to not waste resources computing and indexing on conflicts that will just be overwritten.
+
+A problem is a conflicting version of a document might be a conflict loser, then the interim winner with a higher seq is deleted such that the conflict loser becomes the new winner. The indexer needs to see that old loser as a new winner. Another problem is that if the only conflict version is created or deleted (ie. resolved), we want to update the winner's by\_seq entry to indicate the document's updated conflict status.
+
+That is solved with two different mechanisms:
+
+1. For versions that were conflict losers and now are winners, we solve it by reassigning a new higher sequence to the winner and marking it as the winner and setting the conflict status flag. This ensures the indexers will see the correct document and conflict state. This will require rewriting the the new winner to the WAL with a new sequence.
+
+2. For versions that previously weren't losers, but now are, we write a by\_seq "metadata update" entry into the WAL. It will eventually migrate to it's correct generation and be applied to the corresponding by\_seq entry it is updating. Until then, as the by\_seq index is walked, the btree in all generations is walked simultaneously with entries in hotter generations overriding colder generations. We will also already do this for by\_seq deletions.
 
 ## Single vs. Double fsync
 
@@ -288,36 +307,50 @@ The single fsync enhancement for commits and headers can make commits to a stora
 
 But for generational storage, each commit to larger, colder generations is the result of a single large batched update from a smaller generation. If we have no need to read all the data on start-up on those files (like for 2.0 warmup), we will there be wasting unbounded amounts of disk IO and cpu and time checking the last commits of all generations, increasing startup time and reducing availability of a node. Therefore all generations, except perhaps the very youngest, should be use the double fsync method, with data fsync'd first, then the header.
 
-## Live Data Threshold Exceeded
+
+## Compaction and Spillover
+
+### Live Data Threshold Exceeded
 
 As each storage generation keeps statistics about the size of all live btree nodes and documents, it's possible to know how much live data and metadata is in a file and if it's exceed the generation's threshold. If it does, the coldest documents will be copied to the next coldest generation and the remaining will be copied to a new storage file of the same generation.
 
-When this is done, the old file is still accessible until the all the documents are copied to the next colder generation and the current generation file is generated. It is then deleted and inaccessible to new readers, and current readers will still have access to the old file until they close their file descriptor, when then will cause the OS to completely unlink the file and recover the wasted space.
+When this is done, the old file is still accessible until the all the documents are copied to the next colder generation and the current generation file is generated. It is then deleted and inaccessible to new readers, and current readers will still have access to the old file until they close their file descriptors, which then will cause the OS to completely unlink the file and recover the wasted space.
 
-## Compaction Threshold Exceeded
+### Garbage Threshold Exceeded
 
-To determine how much space is in a storage file is garbage done simply by subtracting the live data size from the total file size. If the garbage exceeds the configurable ratio, then the file is compacted in place.
+To determine how much space is in a storage file is garbage is done simply by subtracting the live data size from the total file size. If the garbage exceeds the configurable ratio, then the file is compacted in place.
 
 As with the Live Data Threshold, the coldest documents can be copied to the next colder generation. Or none at all. The amount copied to the colder generation during compaction should be configurable.
 
 As with the Live Data Threshold process, the original file is kept around until all data is copied to the new file and colder generation, when it is then deleted.
 
-## MVCC
-
-## Range Scans
-
 ## Bloom Filters
 
-## Copy Oldest to Next Generation
+Each Generational Storage File will have a bloom filter generated from the hashes of all the doc ids/keys for a database. This is to improve the speed of disk fetches by avoid looking to files where the document doesn't exist.
 
-## Compaction
+When a write to a storage file occurs, the entire bloom filter is rewritten at the end of the file. It can be stored inside the header.
 
-### Throttle Updates
+With the larger, colder generation files, the bloom filter can be very large. Approximately 9 bits per document stored for a bloom filter with 1% false positive rate. However, the cost of rewriting the whole header will generally be offset of the bulk writes to the file, since the each update will be due relatively large amount of documents migrating from hotter storage to colder. So the space and IO cost per document updated will be still be small.
 
-## Shrinking/Merging Generation
+### False Positive Degradation and Regeneration
 
+As more unique documents are added to the file, the false positive rate of the bloom filter will increase. But when the file is compacted in-place, the entire bloom filter will be regenerated from scratch and brought up to maximal space v.s false positive efficiency.
+
+## MVCC and Range Scans
+
+When traversing the partition by\_seq all files will be scanned simultaneously and the btree index in each file will be walked simultaneously, and a merge sort will occur, with the hottest/newest entry used. The in-memory WAL data and snapshot-able in memory by\_seq entry (as specified in the UPR design specification) is also walked.
+
+If duplicate entries are found, a common and normal occurrence, the entry from the hottest generation file will be used, with entries from colder generations discarded. If the hottest entry is a "metadata deletion" entry, all metadata for the same sequence will be skipped. If the hottest entries are "metadata update" entries, the updates are applied to the hottest concrete entry in order of coldest to hottest.
+
+The process of opening and walking the storage will provide an MVCC snapshot of each file. To snapshot the entire database, the process of walking the indexes will open the files from order of hottest to coldest, an order that will ensure complete logical consistency with persistence state even as generation files are in-place compacted and spilled over to higher generations.
+
+## Shrinking/Merging Generations
+
+When the live data in the coldest generations N-1 and N drops below the live data threshold for generation N after spillover commit (due to deletion tombstones and shrinking edits migrating down), the data is merged into generation N or N+1 (whichever has less live data). If merged into N-1, then N is deleted. If merged into N, the file is renamed to be the new generation N-1 and the old N-1 is deleted.
 
 ## Conflict Management
+
+## Differential Updates
 
 ### by_id Entry - Commulative
 
