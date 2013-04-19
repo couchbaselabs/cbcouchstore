@@ -222,6 +222,7 @@ As generations get insertions, updates, and deletions, they tend to degrade in p
 
 * Wasted Space - For every document update or deletion, there is now wasted space of a previous version that is occupying disk space.
 * Fragmentation - The wasted space, when it occurs between 2 live documents, increases cost of reading the live documents when scanning the documents in by\_seq order, as reading the 2 live documents will either have to also read any wasted space at the file system block level at the end of the first document and at the beginning of the second document, or perform a costly seek to skip over the wasted space. For SSDs the seeks aren't as much a concern except for wasted read-ahead cost that's often performed at various FS cache levels, and for HDDs, the cost is often greater as it can involved a physical disk head arm movement  (though the ordered nature of the document on disk tend toward smaller arm movements).
+* Fragmentation - The wasted space, when it occurs between 2 live documents, increases cost of reading the live documents when scanning the documents in by\_seq order, as reading the 2 live documents will either have to also read any wasted space at the file system block level at the end of the first document and at the beginning of the second document, or perform a costly seek to skip over the wasted space. For SSDs the seeks aren't as much a concern except for wasted read-ahead cost that's often performed at various FS cache levels, and for HDDs, the cost is often greater as it can involved a physical disk head arm movement  (though the ordered nature of the documents on disk tend toward smaller arm movements).
 * Poorer btree node locality. Each update to the generation means btree nodes must rewritten at the end of the file, meaning poorer locality for some branches of the btree, and for nodes not in cache this can entail expensive disk head arm movements.
 * Unbalanced Btree Nodes - For certain update patterns, the deletion of old by\_seq entries for new entries mean the btree nodes can  deteriorate from their ideal balance of the same depth for all leaf nodes with a average case access cost of O(logN) to all nodes, to an absolute worst case of linear cost O(N) to some leafs nodes.
 * Higher false hit ratios of the bloom filters. When a generation is newly created, the bloom filters will have their lowest average false positive rate. As new documents are added to the generation, the false positive rate will increase.
@@ -308,6 +309,28 @@ The tradeoff is we now half the fsyncs, but we must scan all data and meta from 
 The single fsync enhancement for commits and headers can make commits to a storage file faster, with the cost that on start up, all contents written the last segment of a storage file, between the last and second to last header, must be checked for integrity.
 
 But for generational storage, each commit to larger, colder generations is the result of a single large batched update from a smaller generation. If we have no need to read all the data on start-up on those files (like for 2.0 warmup), we will there be wasting unbounded amounts of disk IO and cpu and time checking the last commits of all generations, increasing startup time and reducing availability of a node. Therefore all generations, except perhaps the very youngest, should be use the double fsync method, with data fsync'd first, then the header.
+
+## Alternative Scheme for Valid Header Finding
+
+An alternative design that does not require 4k header markers to instead record the compaction version and file offset of the last valid header for every generational file in the WAL. The WAL will persist all the current valid headers forever, before an older WAL is deleted all the current headers must be persisted to the newer WAL file.
+
+This will require the same number of fsyncs per commit (once to the storage file and once to the WAL).
+
+For file systems that don't do completely honest fsyncs, is is new risk introduced by entirety of the data relying on the log files being available and uncorrupted. If the WAL is lost, all data in all partitions will be lost. For file systems that "lie" about fsync's this is possible on a machine crash, or when the file is . For example, we commit a new log file but the filesystem doesn't fsync the file inode or directory for the new file, losing the file contents.
+
+To get around this, if we detect a WAL file is incorrect or missing, we can read the entire generational storage files from beginning to end, reading in each file's appended items, ignoring data items and noting headers until the end or the very first corrupt item (this requires everything in the file is integrity checked, which it currently is in Couchstore). We scan and we use the last encountered header as the correct header.
+
+To make recovery work, it will also require us to truncate the generational storage files if on file open we detect there is garbage (data begun to be written but not completed) after the last valid header, so that we can continue to append to the end of the file and recover correct headers should the WAL become incorrect.
+
+### Advantages
+
+We no longer have to align the storage file header to any boundary, so we can pack headers contiguous with previous data with no gaps in between. This will save an average of 1/2 the block size (4k by default, so 2k on average) per commit. For larger generations, this will have small benefit as commits are infrequent and large.
+
+We will also eliminate all marker "holes" that occur when items (data, metadata, btree nodes, etc) are written that spans a 4k boundary, we won't have to add or remove the boundary marker when writing or removing, potentially reducing memory copies.
+
+### Disadvantages
+
+The disadvantage (other than the additional engineering work to write file recovering code) are we now must fsync 2 different files to correctly commit data to a generation. On HDDs, this may be significantly slower on average than fsync'ing the same file twice, since it likely requires a physical seek to the different file.
 
 ## Compaction and Spillover
 
