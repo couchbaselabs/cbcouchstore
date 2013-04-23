@@ -374,3 +374,23 @@ The process of opening and walking the storage will provide an MVCC snapshot of 
 ## Shrinking/Merging Generations
 
 When the live data in the coldest generations N-1 and N drops below the live data threshold for generation N after spillover commit (due to deletion tombstones and shrinking edits migrating down), the data is merged into generation N-1 or N (whichever has less live data). If merged into N-1, then N is deleted. If merged into N, the file is renamed to be the new generation N-1 and the old N-1 is deleted.
+
+## Differential Updates
+
+Another optimization is to avoid rewriting the entire document when only a small portion of the document has been updated and instead write out a "diff" that can be applied to the previous state of the document. When a mutation occurs, the database engine can compute if the difference between the old and new document is below some configurable threshold and decide if it would be significantly cheaper to write out the diff instead of rewriting the whole document.
+
+The cost is that reading the document back into memory (if it's not in cache) would require reading in more data, the diffs and the coalesced document, then the diffs are applied by\_seq order to arrive at the correct current version.
+
+Each diff will contain the by\_seq sequence and rev sequence of the previous document version the diff should be applied to. When a diff is written to the WAL, a complete earlier document, along with any other diffs unmigrated to GS, must also be in the WAL. If not the complete document must also be written the WAL.
+
+When writing into GS, the diffs are written out along with the complete earlier document. If the same or earlier document and diffs exist in GS, the diffs may combined into a single object, or some portion may be coalesced into a complete document. The coalesced document and remaining diffs are then written out in a single object. If newer diffs completely overlap earlier diffs, the earlier diffs are discarded.
+
+### Optimizations for UPR clients
+When scanning the by\_seq indexes for UPR clients, if there are diffs and the starting sequence of the UPR client is greater than the previous version of the diff, we can send only the diff to the UPR client (if it can accept diffs as passed via UPR handshake flags). Otherwise, we must send either the whole document from memory (if it's still in cache and the same version as the diff) or combine the diffs into a complete document and send it.
+
+For UPR clients that might refuse an update and it isn't an error (like a hypothetical federated XDCR, for edits that are allow at our cluster, but aren't allowed at the remote cluster due to different security policy) when we ask if the remote cluster wants the current revision, or optimistically send it the diffs created since the UPR starting sequence, it may respond that it has an even earlier revision of the document, or nothing. If the remote cluster has an earlier revision that is between our local complete document and one of the diffs, we can send it just the later diffs since the earlier revision. The remote cluster can then apply the diffs to it's internal state, optionally coalescing them. 
+
+For UPR client that won't refuse an update (intra-cluster replication, non-federated XDCR), we can simply send the diffs that have a higher by\_seq sequence than the starting seq for the UPR client, if that UPR client will accept diffs.
+
+For incremental indexers, it may also be cheaper to receive diffs and apply them to the index rather than whole documents. With indexers we only need to send it diffs with a higher by\_seq value than the starting UPR sequence of the connection. This will imply that the diffs maintain enough information so that indexers use the diffs without applying them to a complete document.
+
